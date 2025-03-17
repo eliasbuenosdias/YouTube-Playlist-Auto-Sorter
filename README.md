@@ -15,10 +15,10 @@ Instrucciones
 ---
 Versión 1: (Sin API de Google)
 
-Dirígete a tu lista de reproducción en YouTube:
+📺 Dirígete a tu lista de reproducción en YouTube:
 https://www.youtube.com/playlist?list=ID
 
-Ejecuta el script usando Tampermonkey.
+🐵 Ejecuta el script usando Tampermonkey.
 
 ---
 Versión 2: (Con API de Google)
