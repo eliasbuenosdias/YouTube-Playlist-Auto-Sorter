@@ -1,253 +1,152 @@
-// ==UserScript==
-// @name         YouTube Playlist Auto-Sorter with Drag & Drop
-// @namespace    http://tampermonkey.net/
-// @version      1.3
-// @description  Ordena automáticamente las listas de reproducción de YouTube con formato de fecha y hora (más antiguo primero) y simula arrastre para persistir los cambios.
-// @author       Claude
-// @match        https://www.youtube.com/*
-// @grant        none
-// @run-at       document-idle
-// @require      https://apis.google.com/js/api.js
-// ==/UserScript==
+import os
+import re
+import google.oauth2.credentials
+import google_auth_oauthlib.flow
+import googleapiclient.discovery
+import googleapiclient.errors
+from datetime import datetime
 
-(function() {
-    'use strict';
+# Configuración de OAuth 2.0 con scopes actualizados
+SCOPES = [
+    'https://www.googleapis.com/auth/youtube',  # Acceso completo a YouTube (lectura y escritura)
+    'https://www.googleapis.com/auth/youtube.readonly',  # Solo lectura
+]
+API_SERVICE_NAME = 'youtube'
+API_VERSION = 'v3'
+CLIENT_SECRETS_FILE = 'client_secret.json'
 
-    // Configuración
-    const CONFIG = {
-        playlistItemSelector: 'ytd-playlist-video-renderer',
-        titleSelector: '#video-title',
-        containerSelector: 'ytd-playlist-video-list-renderer',
-        checkInterval: 1500,
-        autoSortDelay: 3000,
-        retrySortInterval: 5000,
-        maxSortAttempts: 5,
-        newestFirst: false
-    };
+def get_authenticated_service():
+    """Obtiene un servicio autenticado de YouTube."""
+    try:
+        flow = google_auth_oauthlib.flow.InstalledAppFlow.from_client_secrets_file(
+            CLIENT_SECRETS_FILE, SCOPES)
+        credentials = flow.run_local_server(port=8080, access_type='offline', prompt='select_account')
+        return googleapiclient.discovery.build(
+            API_SERVICE_NAME, API_VERSION, credentials=credentials)
+    except googleapiclient.errors.HttpError as e:
+        print(f"Error de autenticación: {e}")
+        return None
+    except Exception as e:
+        print(f"Error inesperado durante la autenticación: {e}")
+        return None
 
-    let sortAttempts = 0;
-    let gapiLoaded = false;
+def get_playlist_videos(youtube, playlist_id):
+    """Obtiene todos los videos de una playlist."""
+    if not youtube:
+        return []  # Retorna una lista vacía si la autenticación falla
 
-    // Función para cargar la biblioteca de cliente de Google API
-    function loadGapiClient() {
-        return new Promise((resolve, reject) => {
-            gapi.load('client:auth2', () => {
-                gapi.client.init({
-                    apiKey: 'YOUR_API_KEY', // Reemplaza con tu clave de API
-                    clientId: 'YOUR_CLIENT_ID', // Reemplaza con tu ID de cliente
-                    discoveryDocs: ['https://www.googleapis.com/discovery/v1/apis/youtube/v3/rest'],
-                    scope: 'https://www.googleapis.com/auth/youtube.force-ssl'
-                }).then(() => {
-                    gapiLoaded = true;
-                    resolve();
-                }).catch(error => {
-                    console.error('Error al cargar la biblioteca de cliente de Google API', error);
-                    reject(error);
-                });
-            });
-        });
-    }
+    videos = []
+    next_page_token = None
 
-    // Función para autenticar al usuario
-    function authenticateUser() {
-        return gapi.auth2.getAuthInstance().signIn();
-    }
+    try:
+        while True:
+            request = youtube.playlistItems().list(
+                part="snippet,contentDetails",
+                playlistId=playlist_id,
+                maxResults=50,
+                pageToken=next_page_token
+            )
+            response = request.execute()
 
-    // Función para obtener los elementos de una lista de reproducción
-    function getPlaylistItems(playlistId) {
-        return gapi.client.youtube.playlistItems.list({
-            part: 'snippet',
-            maxResults: 50,
-            playlistId: playlistId
-        });
-    }
+            for item in response['items']:
+                video_id = item['contentDetails']['videoId']
+                title = item['snippet']['title']
+                position = item['snippet']['position']
+                videos.append({
+                    'id': video_id,
+                    'title': title,
+                    'position': position,
+                    'item_id': item['id']
+                })
 
-    // Función para actualizar el orden de un elemento de la lista de reproducción
-    function updatePlaylistItem(itemId, position) {
-        return gapi.client.youtube.playlistItems.update({
-            part: 'snippet',
-            resource: {
-                id: itemId,
-                snippet: {
-                    playlistId: 'YOUR_PLAYLIST_ID', // Reemplaza con el ID de tu lista de reproducción
-                    position: position
+            next_page_token = response.get('nextPageToken')
+            if not next_page_token:
+                break
+
+        return videos
+    except googleapiclient.errors.HttpError as e:
+        print(f"Error al obtener videos de la playlist: {e}")
+        return []
+    except Exception as e:
+        print(f"Error inesperado al obtener videos: {e}")
+        return []
+
+def extract_date_from_title(title):
+    """Extrae la fecha del título en formato '2024 12 19 18 25 12'."""
+    pattern = r'(\d{4})\s+(\d{2})\s+(\d{2})\s+(\d{2})\s+(\d{2})\s+(\d{2})'
+    match = re.search(pattern, title)
+
+    if match:
+        year, month, day, hour, minute, second = map(int, match.groups())
+        return datetime(year, month, day, hour, minute, second)
+    return None
+
+def sort_videos_by_date(videos):
+    """Ordena los videos por fecha, los más antiguos primero."""
+    dated_videos = []
+    undated_videos = []
+
+    for video in videos:
+        date = extract_date_from_title(video['title'])
+        if date:
+            dated_videos.append((date, video))
+        else:
+            undated_videos.append(video)
+
+    dated_videos.sort(key=lambda x: x[0])
+    return [video for _, video in dated_videos] + undated_videos
+
+def update_playlist_order(youtube, playlist_id, sorted_videos):
+    """Actualiza el orden de los videos en la playlist."""
+    if not youtube:
+        return
+
+    try:
+        for position, video in enumerate(sorted_videos):
+            request = youtube.playlistItems().update(
+                part="snippet",
+                body={
+                    "id": video['item_id'],
+                    "snippet": {
+                        "playlistId": playlist_id,
+                        "position": position,
+                        "resourceId": {
+                            "kind": "youtube#video",
+                            "videoId": video['id']
+                        }
+                    }
                 }
-            }
-        });
-    }
+            )
+            response = request.execute()
+            print(f"Video '{video['title']}' movido a la posición {position}")
+    except googleapiclient.errors.HttpError as e:
+        print(f"Error al actualizar la playlist: {e}")
+    except Exception as e:
+        print(f"Error inesperado al actualizar la playlist: {e}")
 
-    // Función para extraer la fecha y hora del título
-    function extractDateTime(title) {
-        const match = title.match(/(\d{4})\s+(\d{1,2})\s+(\d{1,2})\s+(\d{1,2})\s+(\d{1,2})\s+(\d{1,2})/);
-        if (!match) return null;
+def main():
+    os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = "1"
 
-        const [_, year, month, day, hour, minute, second] = match;
-        return new Date(year, month - 1, day, hour, minute, second);
-    }
+    youtube = get_authenticated_service()
 
-    // Función para ordenar la lista por fecha y hora y actualizar en YouTube
-    async function sortPlaylistByDateTime() {
-        console.log('Intentando ordenar la lista de reproducción...');
+    if not youtube:
+        print("La autenticación falló. El programa se cerrará.")
+        return
 
-        const container = document.querySelector(CONFIG.containerSelector);
-        if (!container) {
-            console.log('No se encontró el contenedor de la lista. Reintentando más tarde...');
-            return false;
-        }
+    print("Autenticación exitosa. Ahora ingrese el ID de la playlist de YouTube.")  # Añadido para asegurar que el mensaje aparezca
 
-        const items = Array.from(container.querySelectorAll(CONFIG.playlistItemSelector));
-        if (items.length <= 1) {
-            console.log('No hay suficientes elementos para ordenar. Reintentando más tarde...');
-            return false;
-        }
+    playlist_id = input("Ingrese el ID de la playlist de YouTube: ")
 
-        console.log(`Encontrados ${items.length} elementos en la lista`);
+    videos = get_playlist_videos(youtube, playlist_id)
+    if not videos:
+        print("No se pudieron obtener los videos de la playlist. El programa se cerrará.")
+        return
 
-        const playlistId = 'YOUR_PLAYLIST_ID'; // Reemplaza con el ID de tu lista de reproducción
+    sorted_videos = sort_videos_by_date(videos)
 
-        // Autenticar usuario si no está autenticado
-        if (!gapiLoaded) {
-            await loadGapiClient();
-        }
+    update_playlist_order(youtube, playlist_id, sorted_videos)
 
-        if (!gapi.auth2.getAuthInstance().isSignedIn.get()) {
-            await authenticateUser();
-        }
+    print("¡Proceso completado! Los videos han sido ordenados permanentemente.")
 
-        const playlistItemsResponse = await getPlaylistItems(playlistId);
-        const playlistItems = playlistItemsResponse.result.items;
-
-        // Mapear elementos a {element, date}
-        const itemsWithDates = items.map(item => {
-            const titleElement = item.querySelector(CONFIG.titleSelector);
-            if (!titleElement) return null;
-
-            const title = titleElement.textContent;
-            const dateTime = extractDateTime(title);
-            const playlistItem = playlistItems.find(pi => pi.snippet.title === title);
-
-            return {
-                element: item,
-                dateTime: dateTime,
-                title: title,
-                itemId: playlistItem ? playlistItem.id : null
-            };
-        }).filter(item => item !== null && item.dateTime !== null && item.itemId !== null);
-
-        console.log(`Encontrados ${itemsWithDates.length} elementos con formato de fecha válido`);
-
-        if (itemsWithDates.length <= 1) {
-            console.log('No hay suficientes elementos con fechas válidas. Reintentando más tarde...');
-            return false;
-        }
-
-        // Ordenar por fecha
-        if (CONFIG.newestFirst) {
-            itemsWithDates.sort((a, b) => b.dateTime - a.dateTime);
-            console.log('Ordenando con el más reciente primero');
-        } else {
-            itemsWithDates.sort((a, b) => a.dateTime - b.dateTime);
-            console.log('Ordenando con el más antiguo primero');
-        }
-
-        // Reordenar el DOM y actualizar en YouTube
-        for (let i = 0; i < itemsWithDates.length; i++) {
-            const item = itemsWithDates[i];
-            container.appendChild(item.element);
-            await updatePlaylistItem(item.itemId, i);
-        }
-
-        console.log('YouTube Playlist ordenada por fecha y hora - Completado con éxito');
-        return true;
-    }
-
-    // Función para agregar botón de ordenación manual
-    function addSortButton() {
-        const header = document.querySelector('ytd-playlist-header-renderer');
-        if (!header) return false;
-
-        const existingButton = document.getElementById('yt-playlist-sorter-button');
-        if (existingButton) return true;
-
-        const button = document.createElement('button');
-        button.id = 'yt-playlist-sorter-button';
-        button.textContent = 'ORDENAR POR FECHA/HORA';
-        button.style.cssText = `
-            background-color: #FF0000;
-            color: white;
-            border: none;
-            border-radius: 4px;
-            padding: 15px 30px;
-            margin: 20px;
-            cursor: pointer;
-            font-size: 30px;
-            font-weight: bold;
-            box-shadow: 0 4px 8px rgba(0, 0, 0, 0.3);
-            position: relative;
-            z-index: 9999;
-            display: block;
-            width: auto;
-        `;
-
-        button.addEventListener('click', () => {
-            sortPlaylistByDateTime();
-            button.style.backgroundColor = '#CC0000';
-            setTimeout(() => {
-                button.style.backgroundColor = '#FF0000';
-            }, 200);
-        });
-
-        header.insertBefore(button, header.firstChild);
-
-        console.log('Botón de ordenación agregado (tamaño grande, color rojo)');
-        return true;
-    }
-
-    // Función para ordenar automáticamente
-    function autoSortPlaylist() {
-        sortAttempts++;
-        console.log(`Intento de ordenación automática #${sortAttempts}`);
-
-        if (sortPlaylistByDateTime()) {
-            console.log('Ordenación automática completada con éxito');
-        } else if (sortAttempts < CONFIG.maxSortAttempts) {
-            console.log(`La ordenación falló. Reintentando en ${CONFIG.retrySortInterval / 1000} segundos...`);
-            setTimeout(autoSortPlaylist, CONFIG.retrySortInterval);
-        } else {
-            console.log('Número máximo de intentos alcanzado. La ordenación automática ha fallado.');
-        }
-    }
-
-    // Inicialización
-    function initialize() {
-        if (window.location.href.includes('/playlist')) {
-            console.log('Detectada página de lista de reproducción. Iniciando script...');
-
-            addSortButton();
-            sortAttempts = 0;
-
-            setTimeout(autoSortPlaylist, CONFIG.autoSortDelay);
-        }
-    }
-
-    const observer = new MutationObserver(() => {
-        if (window.location.href.includes('/playlist')) {
-            console.log('Cambios detectados en la página de lista de reproducción');
-            initialize();
-        }
-    });
-
-    observer.observe(document.body, { childList: true, subtree: true });
-
-    window.addEventListener('load', () => {
-        console.log('Página cargada. Inicializando script...');
-        initialize();
-    });
-
-    setTimeout(() => {
-        console.log('Comprobando si la página ya está cargada...');
-        initialize();
-    }, 1000);
-
-    console.log('Script de ordenación automática de YouTube inicializado');
-})();
+if __name__ == "__main__":
+    main()
